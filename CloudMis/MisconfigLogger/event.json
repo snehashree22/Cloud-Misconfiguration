@@ -1,0 +1,4 @@
+{
+  "action": "analyze",
+  "resource": "s3-bucket"
+}

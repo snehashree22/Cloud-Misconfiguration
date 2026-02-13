@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CloudMis - Cloud Misconfiguration Risk Analyzer (AWS SAM Deployment)
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 10
+    MemorySize: 256
+
+Parameters:
+  # Your existing CloudTrail logs bucket (source)
+  SourceCloudTrailBucketName:
+    Type: String
+    Default: aakash-cloudtrail-logs-2025
+    Description: Name of the S3 bucket where CloudTrail writes logs.
+  # Parent prefix that contains all regions/dates
+  SourceCloudTrailPrefix:
+    Type: String
+    Default: AWSLogs/465983269375/CloudTrail/
+    Description: Prefix in the CloudTrail bucket to scan.
+  GlueDatabaseName:
+    Type: String
+    Default: cloudmis_reports
+    Description: Glue Data Catalog database to store tables discovered by the crawler.
+  AthenaWorkGroupName:
+    Type: String
+    Default: cloudmis_athena
+    Description: Athena WorkGroup for running queries.
+
+Resources:
+
+  # S3 bucket where Lambda will store or read results/logs (destination)
+  AppDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudMisLambdaLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: CloudMisLambdaS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read from the CloudTrail source bucket
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${SourceCloudTrailBucketName}
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Ref SourceCloudTrailPrefix
+                      - !Sub "${SourceCloudTrailPrefix}*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${SourceCloudTrailBucketName}/${SourceCloudTrailPrefix}*
+              # Write to the destination app bucket under reports/
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub "${AppDataBucket.Arn}/reports/*"
+
+  ##############################
+  # Existing API (Stage 1/other)
+  ##############################
+  MisconfigLoggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: MisconfigLogger/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Events:
+        AnalyzeApi:
+          Type: Api
+          Properties:
+            Path: /analyze
+            Method: post
+      Environment:
+        Variables:
+          APP_BUCKET: !Ref AppDataBucket
+
+  #########################################
+  # Stage 2 CloudTrail ETL Processor
+  #########################################
+  CloudTrailProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: CloudTrailProcessor/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceCloudTrailBucketName
+          SOURCE_PREFIX: !Ref SourceCloudTrailPrefix
+          DEST_BUCKET: !Ref AppDataBucket
+          DEST_PREFIX: reports/
+      Events:
+        FifteenMinuteSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Name: CloudMis-Stage2-Schedule
+            Description: Periodically process CloudTrail .json.gz and write simplified events to reports/
+            Enabled: true
+
+  #########################################
+  # Stage 3 - Glue + Athena
+  #########################################
+
+  # Glue Catalog Database to hold the crawler's table
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: CloudMis normalized CloudTrail events (JSONL) catalog
+
+  # IAM role for Glue Crawler (least privilege to read reports/)
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Basic Glue service role permissions
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: CloudMisGlueS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # List the destination bucket (only reports/ prefix)
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt AppDataBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - reports/*
+                      - reports/*
+              # Read JSONL objects under reports/
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "${AppDataBucket.Arn}/reports/*"
+              # Optional: write Glue logs to CWL
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  # Glue Crawler that targets s3://<AppDataBucket>/reports/
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "cloudmis-reports-crawler-${AWS::Region}"
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      Description: Crawls normalized CloudMis JSONL under s3://AppDataBucket/reports/
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${AppDataBucket}/reports/"
+      TablePrefix: cloudmis_
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" }
+          }
+        }
+
+  # Athena WorkGroup with query results landing in s3://<AppDataBucket>/athena-results/
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref AthenaWorkGroupName
+      Description: CloudMis analytics workgroup
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AppDataBucket}/athena-results/"
+
+Outputs:
+  ApiUrl:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/analyze"
+
+  BucketName:
+    Description: "App data bucket name"
+    Value: !Ref AppDataBucket
+
+  ReportsPath:
+    Description: "S3 path where normalized JSONL is written"
+    Value: !Sub "s3://${AppDataBucket}/reports/"
+
+  GlueDatabaseOut:
+    Description: "Glue Data Catalog database"
+    Value: !Ref GlueDatabaseName
+
+  GlueCrawlerName:
+    Description: "Glue crawler name"
+    Value: !Ref GlueCrawler
+
+  AthenaWorkGroupOut:
+    Description: "Athena WorkGroup"
+    Value: !Ref AthenaWorkGroupName
+
+  Stage2FunctionName:
+    Description: "CloudTrail ETL Lambda (Stage 2)"
+    Value: !Ref CloudTrailProcessorFunction

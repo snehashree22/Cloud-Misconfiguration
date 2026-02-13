@@ -1,0 +1,12 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "cloudmis"
+resolve_s3 = true
+s3_prefix = "cloudmis"
+region = "ap-south-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+image_repositories = []
+parameter_overrides = "SourceCloudTrailBucketName=\"aakash-cloudtrail-logs-2025\" SourceCloudTrailPrefix=\"AWSLogs/465983269375/CloudTrail/\""

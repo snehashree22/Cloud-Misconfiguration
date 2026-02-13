@@ -1,0 +1,18 @@
+# Ignore AWS SAM build artifacts
+.aws-sam/
+packaged.yaml
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore credentials
+Creds/
+*.pem
+*.key
+*.env
+.env
+
+# Ignore OS junk files
+.DS_Store
+Thumbs.db
